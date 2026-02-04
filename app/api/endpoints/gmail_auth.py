@@ -276,12 +276,15 @@ async def google_authenticate(
                 detail=f"Error al registrar el refresh token en BD: {e}"
         )
     
+    redirect = RedirectResponse("http://localhost:4200/callback?access_token=" + access_token["token"] + "&token_type=Bearer")
+
+    
     # Guardar el refresh token en cookies del usuario
     set_refresh_token(
-        response=response,
+        response=redirect,
         refresh_token=refresh_token["token"]
     )
-
+    return redirect
     return {
         "access_token": access_token["token"],
         "token_type": "Bearer",
