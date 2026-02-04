@@ -20,7 +20,3 @@ api_router.include_router(usuario_roles.router, prefix="/usuario_roles", tags=["
 api_router.include_router(profile.router, prefix="/profile", tags=["Perfil"])
 api_router.include_router(registro.router, prefix="/public", tags=["Registro Público"])
 
-# Ruta de verificación
-@api_router.get("/")
-async def api_root():
-    return {"message": "API v1 funcionando correctamente"}

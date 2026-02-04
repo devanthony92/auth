@@ -5,34 +5,28 @@ Fecha: 2025-01-18
 """
 
 from typing import Dict, Any, Optional
-from fastapi import APIRouter, HTTPException, Request, status, Depends, Response, Query
+from fastapi import APIRouter, HTTPException, Request, status, Depends, Response
 from fastapi.responses import RedirectResponse
 import httpx
 import urllib.parse
-import jwt
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.access_token import AccessTokenService
 from app.core.database import get_db
 from app.crud import usuario as crud_usuario
 from app.crud.crud_cuenta_social import cuenta_social as crud_cuenta_social
-from app.schemas.usuario import UsuarioCreate
 from app.schemas.cuenta_social import GoogleUser
-from app.auth.gmail_oauth import gmail_oauth
 from app.auth.jwt_handler import (
     create_access_token,
     create_refresh_token,
     set_refresh_token,
     hash_token
 )
-from app.auth.user_data import get_user_complete_data, get_user_roles
-from app.auth.dependencies import get_current_active_user
+from app.auth.user_data import get_user_roles
 from app.auth.refresh_tokens import RefreshTokenService
 import secrets
-import uuid
 from app.core.config import settings
 from app.utils.Logs_login_service import LogLoginService
 from app.utils.GeoIp2 import get_session_context
-from datetime import datetime, timezone
 
 router = APIRouter()
 
@@ -81,63 +75,83 @@ async def google_callback(
     response: Response,
     db: AsyncSession = Depends(get_db)
     ):
+    """
+    Callback de Gmail OAuth2
+    Procesa el código de autorización y extraer parámetros de la solicitud
+    Inicializa la autenticación del usuario usando los datos obtenidos de Google
+    """
+
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     stored_state = request.cookies.get("oauth_state")
 
+    # Eliminar cookie de estado después de leerla
+    response.delete_cookie("oauth_state")
+
     # Verificar errores y estado
     if not code:
-        raise HTTPException(status_code=400, detail="Authorization code missing")
+        raise HTTPException(status_code=400, detail="Codigo de autorización faltante.")
 
     if not state or state != stored_state:
-        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+        raise HTTPException(status_code=400, detail="OAuth state no válido. Posible ataque CSRF.")
 
-    # Intercambiar código por token
-    token_payload = {
-        "client_id": settings.gmail_client_id,
-        "client_secret": settings.gmail_client_secret,
-        "code": code,
-        "redirect_uri": settings.gmail_redirect_uri,
-        "grant_type": "authorization_code",
-    }
+    try:
+        # Intercambiar código por token
+        token_payload = {
+            "client_id": settings.gmail_client_id,
+            "client_secret": settings.gmail_client_secret,
+            "code": code,
+            "redirect_uri": settings.gmail_redirect_uri,
+            "grant_type": "authorization_code",
+        }
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        token_response = await client.post(settings.token_url, data=token_payload)
+        async with httpx.AsyncClient(timeout=10) as client:
+            token_response = await client.post(settings.token_url, data=token_payload)
 
-    if token_response.status_code != 200:
+        if token_response.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Error al obtener token de Google"
+            )
+
+        token_data = token_response.json()
+        access_token = token_data.get("access_token")
+
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Access token no recibido de Google.")
+
+        # Obtener información del usuario
+        async with httpx.AsyncClient() as client:
+            userinfo_response = await client.get(
+                "https://www.googleapis.com/oauth2/v2/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+
+        google_user = GoogleUser(**userinfo_response.json())
+
+        # Validar email verificado
+        if not google_user.verified_email:
+            raise HTTPException(status_code=400, detail="El correo de Google no está verificado, por favor verifica tu correo antes de continuar.")
+        
+
+        # Autenticar usuario en el sistema
+        return await google_authenticate(
+            db=db,
+            google_user=google_user,
+            request=request,
+            response=response
+        )
+    
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Timeout al conectar con Google"
+        )
+    except httpx.RequestError as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Google token exchange failed"
+            detail=f"Error de red al conectar con Google: {str(e)}"
         )
-
-    token_data = token_response.json()
-    access_token = token_data.get("access_token")
-
-    if not access_token:
-        raise HTTPException(status_code=400, detail="Invalid token response")
-
-    # Obtener información del usuario
-    async with httpx.AsyncClient() as client:
-        userinfo_response = await client.get(
-            "https://www.googleapis.com/oauth2/v2/userinfo",
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-
-    google_user = GoogleUser(**userinfo_response.json())
-
-    # Validar email verificado
-    if not google_user.verified_email:
-        raise HTTPException(status_code=400, detail="Google email not verified")
-    
-
-    # Autenticar usuario en el sistema
-    return await google_authenticate(
-        db=db,
-        google_user=google_user,
-        request=request,
-        response=response
-    )
-
 
 async def google_authenticate(
     db: AsyncSession,
@@ -149,7 +163,13 @@ async def google_authenticate(
 ) -> Optional[Dict[str, Any]]:
     """
     Autenticar usuario usando datos de Google OAuth2
-    google_user: Datos del usuario obtenidos de Google
+    Args:
+        db (AsyncSession): Sesión de base de datos
+        google_user (GoogleUser): Datos del usuario obtenidos de Google
+        request (Request): Objeto de solicitud FastAPI
+        response (Response): Objeto de respuesta FastAPI
+    Returns:
+        - Diccionario con tokens de acceso si la autenticación es exitosa
     """
     
     # Buscar cuenta social existente
@@ -177,14 +197,9 @@ async def google_authenticate(
         # Buscar usuario por email
         user = await crud_usuario.get_by_email(db, email=google_user.email)
         
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="No se encontró el usuario asociado a la cuenta social, favor de contactar al soporte."
-            )
-        
-        else:
-            # Crear cuenta social
+        if user: 
+            # Usuario existe pero no tiene cuenta social vinculada
+            # Crear cuenta social para el usuario existente
             await crud_cuenta_social.create_or_update_social_account(
                 db,
                 usuario_id=user.id,
@@ -192,6 +207,12 @@ async def google_authenticate(
                 id_usuario_proveedor=google_user.id,
                 correo=google_user.email,
                 nombre=google_user.name
+            )
+
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="No se encontró el usuario asociado a la cuenta social, favor de contactar al soporte."
             )
     
     if not await crud_usuario.is_active(user):
@@ -265,261 +286,3 @@ async def google_authenticate(
         "access_token": access_token["token"],
         "token_type": "Bearer",
     }
-
-# # # Almacén temporal para estados OAuth (en producción usar Redis)
-# # oauth_states = {}
-
-# # @router.get("/gmail/login")
-# # async def gmail_login(
-# #     redirect_url: Optional[str] = Query(None, description="URL de redirección después del login")
-# # ):
-# #     """
-# #     Iniciar proceso de autenticación con Gmail
-    
-# #     Retorna:
-# #         - authorization_url: URL para redirigir al usuario a Gmail
-# #         - state: Token de estado para validar el callback
-# #     """
-# #     # Generar estado único para prevenir CSRF
-# #     state = secrets.token_urlsafe(32)
-    
-# #     # Guardar estado y URL de redirección
-# #     oauth_states[state] = {
-# #         "redirect_url": redirect_url,
-# #         "timestamp": secrets.token_hex(16)
-# #     }
-    
-# #     # Obtener URL de autorización
-# #     auth_url = gmail_oauth.get_authorization_url(state=state)
-    
-# #     return {
-# #         "authorization_url": auth_url,
-# #         "state": state
-# #     }
-
-
-# # @router.get("/gmail/callback")
-# # async def gmail_callback(
-# #     code: str,
-# #     state: str,
-# #     error: Optional[str] = None,
-# #     error_description: Optional[str] = None,
-# #     db: AsyncSession = Depends(get_db)
-# # ):
-# #     """
-# #     Callback de Gmail OAuth2
-# #     Procesa el código de autorización y autentica al usuario
-# #     """
-# #     # Verificar si hay error
-# #     if error:
-# #         raise HTTPException(
-# #             status_code=status.HTTP_400_BAD_REQUEST,
-# #             detail=f"Error de autenticación: {error_description or error}"
-# #         )
-    
-# #     # Verificar estado
-# #     if state not in oauth_states:
-# #         raise HTTPException(
-# #             status_code=status.HTTP_400_BAD_REQUEST,
-# #             detail="Estado OAuth inválido"
-# #         )
-    
-# #     state_data = oauth_states.pop(state)
-# #     redirect_url = state_data.get("redirect_url")
-    
-# #     try:
-# #         # Intercambiar código por token
-# #         token_data = await gmail_oauth.exchange_code_for_token(code)
-# #         access_token = token_data.get("access_token")
-# #         refresh_token = token_data.get("refresh_token")
-        
-# #         if not access_token:
-# #             raise HTTPException(
-# #                 status_code=status.HTTP_400_BAD_REQUEST,
-# #                 detail="No se pudo obtener token de acceso"
-# #             )
-        
-# #         # Obtener información del usuario
-# #         user_info = await gmail_oauth.get_user_info(access_token)
-        
-# #         # Extraer datos del usuario
-# #         gmail_id = user_info.get("id")
-# #         email = user_info.get("email")
-# #         name = user_info.get("name", "")
-# #         picture = user_info.get("picture", "")
-        
-# #         if not gmail_id or not email:
-# #             raise HTTPException(
-# #                 status_code=status.HTTP_400_BAD_REQUEST,
-# #                 detail="No se pudo obtener información completa del usuario"
-# #             )
-        
-# #         # Buscar cuenta social existente
-# #         existing_social = await crud_cuenta_social.get_by_proveedor_and_id(
-# #             db, proveedor="gmail", id_usuario_proveedor=gmail_id
-# #         )
-        
-# #         user = None
-        
-# #         if existing_social:
-# #             # Usuario existente con cuenta social
-# #             user = await crud_usuario.get(db, id=existing_social.id_usuario)
-            
-# #             # Actualizar token
-# #             await crud_cuenta_social.create_or_update_social_account(
-# #                 db,
-# #                 usuario_id=user.id,
-# #                 proveedor="gmail",
-# #                 id_usuario_proveedor=gmail_id,
-# #                 token_proveedor=access_token,
-# #                 correo=email,
-# #                 nombre=name
-# #             )
-# #         else:
-# #             # Buscar usuario por email
-# #             user = await crud_usuario.get_by_email(db, email=email)
-            
-# #             if not user:
-# #                 # Crear nuevo usuario
-# #                 username = email.split("@")[0] + "_" + str(uuid.uuid4())[:8]
-                
-# #                 # Separar nombre y apellido
-# #                 name_parts = name.split(" ", 1) if name else ["Usuario", "Gmail"]
-# #                 nombres = name_parts[0]
-# #                 apellidos = name_parts[1] if len(name_parts) > 1 else ""
-                
-# #                 user_data = UsuarioCreate(
-# #                     username=username,
-# #                     email=email,
-# #                     nombres=nombres,
-# #                     apellidos=apellidos,
-# #                     password=secrets.token_urlsafe(32),  # Contraseña aleatoria
-# #                     foto=picture
-# #                 )
-                
-# #                 user = await crud_usuario.create(db, obj_in=user_data)
-            
-# #             # Crear cuenta social
-# #             await crud_cuenta_social.create_or_update_social_account(
-# #                 db,
-# #                 usuario_id=user.id,
-# #                 proveedor="gmail",
-# #                 id_usuario_proveedor=gmail_id,
-# #                 token_proveedor=access_token,
-# #                 correo=email,
-# #                 nombre=name
-# #             )
-        
-# #         # Verificar que el usuario esté activo
-# #         if not await crud_usuario.is_active(user):
-# #             raise HTTPException(
-# #                 status_code=status.HTTP_400_BAD_REQUEST,
-# #                 detail="Usuario inactivo"
-# #             )
-        
-# #         # Obtener datos completos del usuario
-# #         user_data = await get_user_complete_data(db, user)
-        
-# #         # Crear token JWT
-# #         jwt_token = create_user_token(
-# #             user_id=user.id,
-# #             email=user.email,
-# #             username=user.username,
-# #             roles=user_data["roles"],
-# #             menus=user_data["menus"],
-# #             apis=user_data["apis"],
-# #             aplicaciones=user_data["aplicaciones"]
-# #         )
-        
-# #         # Si hay URL de redirección, redirigir con el token
-# #         if redirect_url:
-# #             return RedirectResponse(
-# #                 url=f"{redirect_url}?token={jwt_token}&type=gmail"
-# #             )
-        
-# #         # Retornar datos del usuario y token
-# #         return {
-# #             "access_token": jwt_token,
-# #             "token_type": "bearer",
-# #             "user": user_data["user"],
-# #             "roles": user_data["roles"],
-# #             "menus": user_data["menus"],
-# #             "apis": user_data["apis"],
-# #             "aplicaciones": user_data["aplicaciones"],
-# #             "provider": "gmail"
-# #         }
-        
-# #     except HTTPException:
-# #         raise
-# #     except Exception as e:
-# #         raise HTTPException(
-# #             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-# #             detail=f"Error en autenticación con Gmail: {str(e)}"
-# #         )
-
-
-# # @router.post("/gmail/link")
-# # async def link_gmail_account(
-# #     code: str,
-# #     state: str,
-# #     db: AsyncSession = Depends(get_db),
-# #     current_user = Depends(get_current_active_user)
-# # ):
-# #     """
-# #     Vincular cuenta de Gmail a usuario existente
-# #     """
-# #     # Verificar estado
-# #     if state not in oauth_states:
-# #         raise HTTPException(
-# #             status_code=status.HTTP_400_BAD_REQUEST,
-# #             detail="Estado OAuth inválido"
-# #         )
-    
-# #     oauth_states.pop(state)
-    
-# #     try:
-# #         # Intercambiar código por token
-# #         token_data = await gmail_oauth.exchange_code_for_token(code)
-# #         access_token = token_data.get("access_token")
-        
-# #         # Obtener información del usuario
-# #         user_info = await gmail_oauth.get_user_info(access_token)
-        
-# #         gmail_id = user_info.get("id")
-# #         email = user_info.get("email")
-# #         name = user_info.get("name", "")
-        
-# #         # Verificar que la cuenta no esté ya vinculada
-# #         existing_social = await crud_cuenta_social.get_by_proveedor_and_id(
-# #             db, proveedor="gmail", id_usuario_proveedor=gmail_id
-# #         )
-        
-# #         if existing_social and existing_social.id_usuario != current_user.id:
-# #             raise HTTPException(
-# #                 status_code=status.HTTP_400_BAD_REQUEST,
-# #                 detail="Esta cuenta de Gmail ya está vinculada a otro usuario"
-# #             )
-        
-# #         # Crear o actualizar cuenta social
-# #         await crud_cuenta_social.create_or_update_social_account(
-# #             db,
-# #             usuario_id=current_user.id,
-# #             proveedor="gmail",
-# #             id_usuario_proveedor=gmail_id,
-# #             token_proveedor=access_token,
-# #             correo=email,
-# #             nombre=name
-# #         )
-        
-# #         return {"message": "Cuenta de Gmail vinculada correctamente"}
-        
-# #     except HTTPException:
-# #         raise
-# #     except Exception as e:
-# #         raise HTTPException(
-# #             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-# #             detail=f"Error al vincular cuenta de Gmail: {str(e)}"
-# #         )
-
-
-
