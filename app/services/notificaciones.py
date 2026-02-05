@@ -19,7 +19,7 @@ class NotificationService:
             httpx.HTTPError: Si hay un error en la solicitud HTTP.
         """
         EMAIL_API_URL = settings.base_url_notificaciones + "/api/send/email"
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 EMAIL_API_URL,
                 json=payload,
